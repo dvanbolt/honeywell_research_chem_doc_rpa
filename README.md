@@ -60,8 +60,12 @@ configs:
       type: "SQLBatchSource"  # or "CSVBatchSource"
       server: "your-server"
       database: "your-database"
-      tenant_id: "your-azure-tenant-id"
-      #file_path: "path to static csv of [item_number],[catalog_number],[batch_number]
+      tenant_id: "your-azure-tenant-id" #or use {{ env_var('<environment variable') }} and the config will attempt to resolve it for you
+      #file_path: (IF CSV source) path to static csv of [item_number],[catalog_number],[batch_number]
+      secret: #or hide more serious secrets like this and it will find them with the keyring library
+        type: keyring
+        url: "windows cred manager url" 
+        user: "windows cred manager uid"
     cache:
       type: "LocalCache"
       path: "path/to/cache.pkl"
