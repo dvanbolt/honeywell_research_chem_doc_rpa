@@ -4,8 +4,8 @@ configs:
     document: coa
     debug: False
     run:
-      limit: 3
-      max_attempts: 3
+      limit: 0
+      max_attempts: 1
       print_cache: False
       save_cache: True
       refresh_cache: True
@@ -33,8 +33,8 @@ configs:
     document: coa
     debug: False
     run:
-      limit: 0
-      max_attempts: 2
+      limit: 5
+      max_attempts: 0
       print_cache: False
       save_cache: True
       refresh_cache: True
