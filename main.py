@@ -18,6 +18,8 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
+
+from pywin.framework.scriptutils import lastScript
 from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
@@ -32,6 +34,8 @@ from zoneinfo import ZoneInfo
 
 
 init(convert=True)
+
+log = logging.getLogger(__name__)
 
 def get_module_class(class_name: str) -> type:
     for name, obj in inspect.getmembers(sys.modules[__name__]):
@@ -256,7 +260,8 @@ class LocalCache(DocCache,dict):
         path = Path(self.config.path)
         if path.exists() and path.is_file():
             with open(path, 'rb') as f:
-                self.__dict__ = pickle.loads(f.read())
+                data = pickle.loads(f.read())
+            self.update(data)
         self._path = path
 
     def add_batch(self,item:str,catalog:str,batch:str) -> BatchRecord:
@@ -299,11 +304,19 @@ class LocalCache(DocCache,dict):
         return added,updated
 
     def unresolved_keys(self, max_attempts:int=0,selector:t.Optional[t.Callable] = None, **kwargs) -> list[BatchRecord]:
-        return [k for (k,v) in self.items() if not v['file_path'] and (max_attempts == 0 or v['attempts'] <= max_attempts) and (selector is None or selector(v))]
+        return [k for (k,v) in self.items() if v['file_path'] is None and (max_attempts == 0 or v['attempts'] <= max_attempts) and (selector is None or selector(v))]
+
+    def unresolved(self, max_attempts:int=0,) -> list[BatchRecord]:
+        return [v for (k, v) in self.items() if
+                v['file_path'] is None and (max_attempts == 0 or v['attempts'] <= max_attempts)]
+
+    def resolved(self, max_attempts:int=0,selector:t.Optional[t.Callable] = None, **kwargs) -> list[BatchRecord]:
+        return [v for (k, v) in self.items() if
+                v['file_path'] is not None]
 
     def save(self)->None:
         with open(self._path,'wb') as f:
-            f.write(pickle.dumps(self.__dict__))
+            f.write(pickle.dumps(self))
 
     @classmethod
     def open(cls,path)->t.Self:
@@ -317,11 +330,20 @@ class LocalCache(DocCache,dict):
         return instance
 
     def to_csv(self,path:str|Path,encoding='utf-8',**kwargs)->None:
+        log.info(f"Writing cache to {path}")
         if len(self)>0:
             with open(path, 'w', encoding=encoding,newline='') as output_file:
                 dict_writer = csv.DictWriter(output_file, list(self.values())[0].keys())
                 dict_writer.writeheader()
                 dict_writer.writerows(self.values())
+
+    def stats(self)->dict[str,int]:
+        return dict(batches=len(self),
+                    resolved=len([k for (k,v) in self.items() if v['file_path'] is not None]),
+                    last_attempt=max([v['last_attempt'] for v in self.values() if v['last_attempt']]),
+                    failed=len([k for (k,v) in self.items() if v['file_path'] is None and v['last_attempt'] is not None]),
+                    not_attempted = len([k for (k, v) in self.items() if v['file_path'] is None and v['last_attempt'] is None])
+                    )
 
 class SQLCache(DocCache):
     def __init__(self,config:Config):
@@ -337,7 +359,7 @@ class BatchSource(ABC):
 class SQLBatchSource(BatchSource):
     def _get_sql_connection(self) -> pyodbc.Connection:
         credential = AzureCliCredential(
-            tenant_id=self.config.tenant_id
+            tenant_id=self.config.tenant
         )
         databaseToken = credential.get_token("https://database.windows.net/")
         SQL_COPT_SS_ACCESS_TOKEN = 1256
@@ -378,6 +400,7 @@ class SQLBatchSource(BatchSource):
             header = [column[0] for column in cursor.description]
             for row in results:
                 ret.append(dict(zip(header, row)))
+
         return ret
 
 class CSVBatchSource(BatchSource):
@@ -399,24 +422,29 @@ class DocumentBot(ABC):
             self.path = Path.cwd()
         else:
             self.path = Path(path)
-        self.settings = Config.load(self.path / "config.yaml")
+        config_path = self.path / "config.yaml"
+        self.settings = Config.load(config_path)
         self.config = self.settings.configs[self.settings.default_config]
-        self.log = self._build_log(self.config.log)
+        self._build_log(self.config.log)
+        log.info(f"Loaded config '"+Fore.GREEN + self.settings.default_config  + Fore.WHITE + f"' from {config_path}")
         self.batch_source = self._load_class_with_config(self.config.batch_source)
         self.cache = self._load_class_with_config(self.config.cache)
+        log.info(f"Loaded {self.cache.__class__.__name__}: {', '.join([k+' = '+str(v) for (k,v) in self.cache.stats().items()])}")
         self.schedule = Schedule(self.config.schedule)
+
 
     def _load_class_with_config(self,config:Config):
         return get_module_class(config.type)(config)
 
-    def _build_log(self,config:Config)->logging.Logger:
+        #if hasattr(cls,'open')
+    def _build_log(self,config:Config)->None:
         COLOR_MAPPING = dict(DEBUG=Fore.LIGHTMAGENTA_EX,
                              INFO=Fore.LIGHTBLUE_EX,
                              WARNING=Fore.YELLOW,
                              ERROR=Fore.LIGHTRED_EX,
                              CRITICAL=Fore.RED)
 
-        logger = logging.getLogger(__name__)
+        logger = logging.getLogger()
         logger.setLevel(logging.DEBUG)
         console_handler = logging.StreamHandler()
         if config.file:
@@ -452,7 +480,7 @@ class DocumentBot(ABC):
             return record
 
         logging.setLogRecordFactory(record_factory)
-        return logger
+ 
 
     def run(self,service:bool=False,**kwargs):
         if not service:
@@ -462,11 +490,11 @@ class DocumentBot(ABC):
             tick = 0
             while True:
                 if datetime.now(timezone.utc) >= self.schedule.next_run:
-                    self.log.info(f"Triggering scheduled run")
+                    log.info(f"Triggering scheduled run")
                     self.run_once(**kwargs)
                     self.schedule.complete()
                 else:
-                    self.log.debug(f"Schedule up to date. Next run in {self.schedule.time_to_next_run}")
+                    log.debug(f"Schedule up to date. Next run in {self.schedule.time_to_next_run}")
 
                 tick += 1
                 time.sleep(self.config.schedule.polling_interval)
@@ -485,17 +513,32 @@ class HoneywellCoXDocumentBot(DocumentBot):
         run_kwargs = default_kwargs | kwargs
         if run_kwargs['refresh_cache']:
             required_batches = self.batch_source.get(limit = run_kwargs['limit'])
+            log.info(
+                f"{self.batch_source.__class__.__name__} returned {len(required_batches)} row{'s' if len(required_batches) != 1 else ''}{' (limited)' if run_kwargs['limit'] else ''}")
             added,updated = self.cache.refresh(required_batches)
-        batches_to_resolve = self.cache.unresolved_keys(max_attempts=run_kwargs['max_attempts'])
-        resolved_batches = self._get_documents(batches=batches_to_resolve,
-                                                            save_dir=self.config.document_path,
-                                                            doc_type=self.config.document)
+            if added:
+                log.info(f"Added {len(added)} row{'s' if len(added) != 1 else ''} to cache")
+            if updated:
+                log.info(f"Updated {len(updated)} existing row{'s' if len(updated) != 1 else ''} in cache")
 
-        self.cache.update_batches(resolved_batches)
+        batches_to_resolve = self.cache.unresolved_keys(max_attempts=run_kwargs['max_attempts'])
+        if batches_to_resolve:
+            log.info(f"Attempting to resolve {len(batches_to_resolve)} batches with no document{' and that have less than '+str(run_kwargs['max_attempts']+1) +' attempts' if run_kwargs['max_attempts'] else ''}")
+            resolved_batches = self._get_documents(batches=batches_to_resolve,
+                                                                save_dir=self.config.document_path,
+                                                                doc_type=self.config.document)
+
+            resolved_count = len([d for d in resolved_batches.values() if d is not None])
+            log.info(f"Found {resolved_count} document{'s' if resolved_count != 1 else ''} and downloaded to {self.config.document_path}")
+            self.cache.update_batches(resolved_batches)
+        else:
+            log.info(f"No records to resolve from cache.")
+
         if run_kwargs['print_cache']:...
             #make a cute printing method
 
-        if run_kwargs['save_cache']:
+        if run_kwargs['save_cache'] and batches_to_resolve:
+            log.info(f"Saving cache with updated file paths.")
             self.cache.save()
 
 
@@ -515,15 +558,18 @@ class HoneywellCoXDocumentBot(DocumentBot):
             if isinstance(bk, tuple):
                 return tuple(map(_trim_id, bk))
             elif isinstance(bk, Path):
-                b,c = bk.stem.split('_')
-                return _trim_id(c), _trim_id(b)
+                b,*c = bk.stem.split('_')
+                if not c:
+                    raise ValueError(f"Could not parse file into batch key: {bk.name}")
+                return _trim_id(c[0]), _trim_id(b)
             else:
                 raise TypeError(bk)
+        if doc_type not in ('coo','coa'):
+            raise ValueError('doc_type must be coa/coo')
 
         output:dict[tuple[str,str],Path|None] = {}
         root_url = f"https://lab.honeywell.com/en/{doc_type}?orderdirect=true"
-        if doc_type not in ('coo','coa'):
-            raise ValueError('doc_type must be coa/coo')
+
         target_dir = Path(save_dir).resolve()
         if not target_dir.exists():
             target_dir.mkdir(parents=True)
@@ -543,14 +589,16 @@ class HoneywellCoXDocumentBot(DocumentBot):
         driver_initialized = False
         exception = False
         try:
-            for batch in batches:
+            total_batches = len(batches)
+            for batch_count, batch in enumerate(batches):
                 batch_key = parse_batch_key(batch)
                 existing_doc = existing_docs.get(batch_key)
+                output[batch] = None
                 if existing_doc:
                     output[batch] = existing_doc
-                    self.log.info(f"Already have {doc_type} for {batch}. key = {batch_key}")
+                    log.info(f"Record {batch_count+1}/{total_batches}: Already have {doc_type} for {batch}. key = {batch_key}")
                 else:
-                    self.log.info(f"Downloading {doc_type} for {batch}. key = {batch_key}")
+                    log.info(f"Record {batch_count+1}/{total_batches}: Downloading {doc_type} for {batch}. key = {batch_key}")
                     if not driver_initialized:
                         # options.add_argument('--headless=new')
                         driver = webdriver.Chrome(options=options)
@@ -564,11 +612,10 @@ class HoneywellCoXDocumentBot(DocumentBot):
                         ))
                         next_button.click()
 
-                        #north_america = wait.until(EC.presence_of_element_located(
                         north_america = wait.until(EC.element_to_be_clickable(
                             (By.XPATH, "//a[contains(.//span, 'North America')]")
                         ))
-                        #time.sleep(3)
+
                         north_america.click()
                         usa = wait.until(EC.element_to_be_clickable(
                             (By.XPATH, "//a[.//img[contains( @ src, 'usa.gif')]]")
@@ -594,7 +641,7 @@ class HoneywellCoXDocumentBot(DocumentBot):
                     except TimeoutException:
                         try:
                             wait.until(EC.presence_of_element_located((By.CLASS_NAME, "no-total-result")))
-                            output[batch] = None
+                            log.warning(f"Could not find document for {batch_key}")
                         except TimeoutException:
                             raise Exception("Could not find a document or identify 'not found' messages.")
                     else:
@@ -609,37 +656,23 @@ class HoneywellCoXDocumentBot(DocumentBot):
                                 downloaded = True
                                 break
                             else:
-                                time.sleep(1)
+                                time.sleep(0.25)
                                 i+=1
                         if downloaded:
                             bk = parse_batch_key(expected_path)
                             output[batch] = expected_path
                             existing_docs[bk] = expected_path
-                            #print(f"Downloaded doc for {batch} with key {bk}")
                         else:
-                            raise Exception("Download timed out.")
+                            log.error(f"Download timed out after {download_timeout} seconds")
                     finally:
                         for i in range(len(product_number)):
                             catalog_entry.send_keys(Keys.BACKSPACE)
-                            #time.sleep(0.05)
                         for i in range(len(batch_number)):
                             batch_entry.send_keys(Keys.BACKSPACE)
-                            #time.sleep(0.05)
-
-                        #not used but backup for fixing the downloading of the previous link
-                        if downloaded and 1==2:
-                            catalog_entry.send_keys("XX")
-                            catalog_entry.send_keys(Keys.ENTER)
-                            wait.until(EC.presence_of_element_located((By.XPATH,"//span[@class='no-result-key'][contains(text(), 'XXX')]")))
-                            catalog_entry.send_keys(Keys.BACKSPACE)
-                            catalog_entry.send_keys(Keys.BACKSPACE)
-
-
-
 
         except Exception as e:
             exception = True
-            self.log.critical(e, exc_info=True)
+            log.critical(e, exc_info=True)
         if driver_initialized:
             if exception and self.config.debug:
                 i = input(f"Press any key to exit.")
@@ -648,11 +681,10 @@ class HoneywellCoXDocumentBot(DocumentBot):
 
 
     def interrupt_handler(self, signo, frame)->None:
-        if input("Keyboard interrupt.\nSave cache? (y/n)->") == "y":
-            self.cache.save()
+        self.cache.save()
         exit("bye")
 
 if __name__ == '__main__':
     bot = HoneywellCoXDocumentBot()
-    #bot.run(service=True)
-    bot.run()
+    print(bot.cache.stats())
+    bot.cache.to_csv(r'temp\cache.csv')
