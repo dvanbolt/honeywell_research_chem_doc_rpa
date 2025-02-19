@@ -14,12 +14,12 @@ import signal
 import typing as t
 import pyodbc
 import croniter
+from enum import Enum
+from collections import namedtuple
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
-
-from pywin.framework.scriptutils import lastScript
 from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
@@ -31,7 +31,6 @@ from azure.identity import AzureCliCredential
 from types import SimpleNamespace
 from colorama import Fore,init
 from zoneinfo import ZoneInfo
-
 
 init(convert=True)
 
@@ -45,7 +44,27 @@ def get_module_class(class_name: str) -> type:
     else:
         raise ValueError(f"Class '{class_name}' not found")
 
+BatchKey = namedtuple('BatchKey', ['catalog_number', 'batch_number'])
+
+class BotOutcome(Enum):
+    DEFAULT = 0
+    SUCCESS = 1
+    FAILED = 2
+    EXCEPTION = 3
+
+@dataclass
+class DocumentResult:
+    outcome: BotOutcome = BotOutcome.DEFAULT
+    exception: t.Optional[Exception] = None
+    timestamp: t.Optional[datetime] = None
+
+@dataclass(kw_only=True)
+class HoneywellDocumentResult(DocumentResult):
+    file_path: t.Optional[Path] = None
+
+
 BatchRecord = dict[str, str | int | datetime | Path | None]
+
 
 #Quick recursively deserializing config
 class Config(SimpleNamespace):
@@ -145,7 +164,7 @@ class Config(SimpleNamespace):
             self.__dict__["paths"] = _r(self.__dict__["paths"])
         return self
 
-@dataclass
+@dataclass()
 class SQLConfig:
     server: str
     name: str | None = None
@@ -253,6 +272,104 @@ class DocCache(ABC):
     @abstractmethod
     def open(cls, path)->t.Self:...
 
+class BatchSource(ABC):
+    def __init__(self,config:Config):
+        self.config = config
+
+    @abstractmethod
+    def get(self,limit:int=0)->list[dict]:...
+
+class DocumentBot(ABC):
+    def __init__(self, path: Path | str | None = None):
+        if path is None:
+            self.path = Path.cwd()
+        else:
+            self.path = Path(path)
+        config_path = self.path / "config.yaml"
+        self.settings = Config.load(config_path)
+        self.config = self.settings.configs[self.settings.default_config]
+        self._build_log(self.config.log)
+        log.info(f"Loaded config '" + Fore.GREEN + self.settings.default_config + Fore.WHITE + f"' from {config_path}")
+        self.batch_source = self._load_class_with_config(self.config.batch_source)
+        self.cache = self._load_class_with_config(self.config.cache)
+        log.info(
+            f"Loaded {self.cache.__class__.__name__}: {', '.join([k + ' = ' + str(v) for (k, v) in self.cache.stats().items()])}")
+        self.schedule = Schedule(self.config.schedule)
+
+    def _load_class_with_config(self, config: Config):
+        return get_module_class(config.type)(config)
+
+        # if hasattr(cls,'open')
+
+    def _build_log(self, config: Config) -> None:
+        COLOR_MAPPING = dict(DEBUG=Fore.LIGHTMAGENTA_EX,
+                             INFO=Fore.LIGHTBLUE_EX,
+                             WARNING=Fore.YELLOW,
+                             ERROR=Fore.LIGHTRED_EX,
+                             CRITICAL=Fore.RED)
+
+        logger = logging.getLogger()
+        logger.setLevel(logging.DEBUG)
+        console_handler = logging.StreamHandler()
+        if config.file:
+            cp = Path(config.file_path)
+            if not cp.parent.exists():
+                cp.parent.mkdir(parents=True)
+            file_handler = logging.FileHandler(config.file_path)
+            if isinstance(config.file_level, int):
+                file_handler.setLevel(config.file_level)
+            elif isinstance(config.file_level, str):
+                file_handler.setLevel(getattr(logging, config.file_level.upper()))
+            file_formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+            file_handler.setFormatter(file_formatter)
+            logger.addHandler(file_handler)
+        if config.console:
+            if isinstance(config.console_level, int):
+                console_handler.setLevel(config.console_level)
+            elif isinstance(config.console_level, str):
+                console_handler.setLevel(getattr(logging, config.console_level.upper()))
+            console_handler.setLevel(logging.DEBUG)
+            console_formatter = logging.Formatter(
+                '%(asctime)s - %(name)s - %(funcName)s - %(levelname_colored)s - %(message)s')
+            console_handler.setFormatter(console_formatter)
+            logger.addHandler(console_handler)
+        else:
+            console_handler.setLevel(logging.CRITICAL + 1)
+
+        default_factory = logging.getLogRecordFactory()
+
+        def record_factory(*args, **kwargs):
+            record = default_factory(*args, **kwargs)
+            record.levelname_colored = COLOR_MAPPING[record.levelname] + record.levelname + Fore.RESET
+            return record
+
+        logging.setLogRecordFactory(record_factory)
+
+    def run(self, service: bool = False, **kwargs):
+        if not service:
+            return self.run_once(**kwargs)
+        else:
+            signal.signal(signal.SIGINT, self.interrupt_handler)
+            tick = 0
+            while True:
+                if datetime.now(timezone.utc) >= self.schedule.next_run:
+                    log.info(f"Triggering scheduled run")
+                    self.run_once(**kwargs)
+                    self.schedule.complete()
+                else:
+                    log.debug(f"Schedule up to date. Next run in {self.schedule.time_to_next_run}")
+
+                tick += 1
+                time.sleep(self.config.schedule.polling_interval)
+
+    @abstractmethod
+    def run_once(self, **kwargs) -> None:
+        ...
+
+    @abstractmethod
+    def interrupt_handler(self, signo, frame) -> None:
+        ...
+
 class LocalCache(DocCache,dict):
     __PROPS__ = ['item_number',]
     def __init__(self,config):
@@ -349,13 +466,6 @@ class SQLCache(DocCache):
     def __init__(self,config:Config):
         raise NotImplementedError()
 
-class BatchSource(ABC):
-    def __init__(self,config:Config):
-        self.config = config
-
-    @abstractmethod
-    def get(self,limit:int=0)->list[dict]:...
-
 class SQLBatchSource(BatchSource):
     def _get_sql_connection(self) -> pyodbc.Connection:
         credential = AzureCliCredential(
@@ -415,97 +525,6 @@ class CSVBatchSource(BatchSource):
                     break
                 i += 1
         return data
-
-class DocumentBot(ABC):
-    def __init__(self, path: Path | str | None = None):
-        if path is None:
-            self.path = Path.cwd()
-        else:
-            self.path = Path(path)
-        config_path = self.path / "config.yaml"
-        self.settings = Config.load(config_path)
-        self.config = self.settings.configs[self.settings.default_config]
-        self._build_log(self.config.log)
-        log.info(f"Loaded config '"+Fore.GREEN + self.settings.default_config  + Fore.WHITE + f"' from {config_path}")
-        self.batch_source = self._load_class_with_config(self.config.batch_source)
-        self.cache = self._load_class_with_config(self.config.cache)
-        log.info(f"Loaded {self.cache.__class__.__name__}: {', '.join([k+' = '+str(v) for (k,v) in self.cache.stats().items()])}")
-        self.schedule = Schedule(self.config.schedule)
-
-
-    def _load_class_with_config(self,config:Config):
-        return get_module_class(config.type)(config)
-
-        #if hasattr(cls,'open')
-    def _build_log(self,config:Config)->None:
-        COLOR_MAPPING = dict(DEBUG=Fore.LIGHTMAGENTA_EX,
-                             INFO=Fore.LIGHTBLUE_EX,
-                             WARNING=Fore.YELLOW,
-                             ERROR=Fore.LIGHTRED_EX,
-                             CRITICAL=Fore.RED)
-
-        logger = logging.getLogger()
-        logger.setLevel(logging.DEBUG)
-        console_handler = logging.StreamHandler()
-        if config.file:
-            cp = Path(config.file_path)
-            if not cp.parent.exists():
-                cp.parent.mkdir(parents=True)
-            file_handler = logging.FileHandler(config.file_path)
-            if isinstance(config.file_level,int):
-                file_handler.setLevel(config.file_level)
-            elif isinstance(config.file_level,str):
-                file_handler.setLevel(getattr(logging,config.file_level.upper()))
-            file_formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-            file_handler.setFormatter(file_formatter)
-            logger.addHandler(file_handler)
-        if config.console:
-            if isinstance(config.console_level,int):
-                console_handler.setLevel(config.console_level)
-            elif isinstance(config.console_level,str):
-                console_handler.setLevel(getattr(logging,config.console_level.upper()))
-            console_handler.setLevel(logging.DEBUG)
-            console_formatter = logging.Formatter(
-                '%(asctime)s - %(name)s - %(funcName)s - %(levelname_colored)s - %(message)s')
-            console_handler.setFormatter(console_formatter)
-            logger.addHandler(console_handler)
-        else:
-            console_handler.setLevel(logging.CRITICAL + 1)
-
-        default_factory = logging.getLogRecordFactory()
-
-        def record_factory(*args, **kwargs):
-            record = default_factory(*args, **kwargs)
-            record.levelname_colored = COLOR_MAPPING[record.levelname] + record.levelname + Fore.RESET
-            return record
-
-        logging.setLogRecordFactory(record_factory)
- 
-
-    def run(self,service:bool=False,**kwargs):
-        if not service:
-            return self.run_once(**kwargs)
-        else:
-            signal.signal(signal.SIGINT, self.interrupt_handler)
-            tick = 0
-            while True:
-                if datetime.now(timezone.utc) >= self.schedule.next_run:
-                    log.info(f"Triggering scheduled run")
-                    self.run_once(**kwargs)
-                    self.schedule.complete()
-                else:
-                    log.debug(f"Schedule up to date. Next run in {self.schedule.time_to_next_run}")
-
-                tick += 1
-                time.sleep(self.config.schedule.polling_interval)
-
-
-
-    @abstractmethod
-    def run_once(self, **kwargs)->None:...
-
-    @abstractmethod
-    def interrupt_handler(self, signo, frame)->None:...
 
 class HoneywellCoXDocumentBot(DocumentBot):
     def run_once(self,**kwargs):
