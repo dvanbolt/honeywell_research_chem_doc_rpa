@@ -264,10 +264,10 @@ class LocalCache(DocCache,dict):
             self.update(data)
         self._path = path
 
-    def add_batch(self,item:str,catalog:str,batch:str) -> BatchRecord:
+    def add_batch(self,item:str,catalog:str,batch:str,batch_source:str) -> BatchRecord:
         key = (catalog.lower(),batch.lower())
         if key not in self:
-            new_batch = {"item_number":item,"catalog_number":catalog,"batch_number":batch,"attempts":0,"last_attempt":None,"file_path":None}
+            new_batch = {"item_number":item,"catalog_number":catalog,"batch_number":batch,"batch_source":batch_source,"added_on":datetime.now(),"attempts":0,"last_attempt":None,"file_path":None}
             self[key] = new_batch
             return new_batch
         else:
@@ -290,7 +290,7 @@ class LocalCache(DocCache,dict):
             updated.append(self.update_batch(*k, v))
         return updated
 
-    def refresh(self,batches:list[dict]) -> tuple[list[BatchRecord],list[BatchRecord]]:
+    def refresh(self,batches:list[dict],batch_source:str) -> tuple[list[BatchRecord],list[BatchRecord]]:
         added, updated = [],[]
         for row in batches:
             key = (row["catalog_number"].lower(),row["batch_number"].lower())
@@ -300,7 +300,7 @@ class LocalCache(DocCache,dict):
                     rec[p] = row[p]
                 updated.append(rec)
             else:
-                added.append(self.add_batch(*row.values()))
+                added.append(self.add_batch(*row.values(),batch_source=batch_source))
         return added,updated
 
     def unresolved_keys(self, max_attempts:int=0,selector:t.Optional[t.Callable] = None, **kwargs) -> list[BatchRecord]:
@@ -337,13 +337,17 @@ class LocalCache(DocCache,dict):
                 dict_writer.writeheader()
                 dict_writer.writerows(self.values())
 
+
     def stats(self)->dict[str,int]:
         return dict(batches=len(self),
                     resolved=len([k for (k,v) in self.items() if v['file_path'] is not None]),
-                    last_attempt=max([v['last_attempt'] for v in self.values() if v['last_attempt']]),
+                    last_attempt=max([v['last_attempt'] for v in self.values() if v['last_attempt']]) if len(self) else None,
                     failed=len([k for (k,v) in self.items() if v['file_path'] is None and v['last_attempt'] is not None]),
                     not_attempted = len([k for (k, v) in self.items() if v['file_path'] is None and v['last_attempt'] is None])
                     )
+
+    def add_key(self,key:str,default_value:t.Any,default_func:t.Optional[t.Callable]=None) -> None:
+
 
 class SQLCache(DocCache):
     def __init__(self,config:Config):
@@ -383,14 +387,12 @@ class SQLBatchSource(BatchSource):
         query = f"""
             select
             {"TOP "+str(limit) if limit else ""}
-            CONCAT(UPPER(a.DataAreaId),'-',a.ItemId) [item_number]
+            CONCAT(UPPER(a.DATAAREAID),'-',a.ITEMID) [item_number]
             ,c.SEARCHNAME [catalog_number]
-            ,b.INVENTBATCHID [batch_number]
-            FROM InventTransOrigin a
-            inner join InventTrans o on o.INVENTTRANSORIGIN = a.RECID and a.DataAreaId = o.DATAAREAID
-            inner join dbo.InventDim b on o.INVENTDIMID = b.INVENTDIMID and a.DataAreaId = b.DATAAREAID and b.INVENTBATCHID is not null
-            inner join [dbo].EcoResProduct c on c.DISPLAYPRODUCTNUMBER = CONCAT(UPPER(a.DataAreaId),'-',a.ItemId)
-            where a.DataAreaId = 'hwna'"""
+            ,a.INVENTBATCHID [batch_number]
+            FROM dbo.inventbatch a
+            inner join [dbo].EcoResProduct c on c.DISPLAYPRODUCTNUMBER = CONCAT(UPPER(a.DATAAREAID),'-',a.ITEMID)
+            where a.DATAAREAID = 'hwna' """
 
         connection = self._get_sql_connection()
         ret = []
@@ -444,7 +446,7 @@ class DocumentBot(ABC):
                              ERROR=Fore.LIGHTRED_EX,
                              CRITICAL=Fore.RED)
 
-        logger = logging.getLogger()
+        logger = logging.getLogger(__name__)
         logger.setLevel(logging.DEBUG)
         console_handler = logging.StreamHandler()
         if config.file:
@@ -515,7 +517,7 @@ class HoneywellCoXDocumentBot(DocumentBot):
             required_batches = self.batch_source.get(limit = run_kwargs['limit'])
             log.info(
                 f"{self.batch_source.__class__.__name__} returned {len(required_batches)} row{'s' if len(required_batches) != 1 else ''}{' (limited)' if run_kwargs['limit'] else ''}")
-            added,updated = self.cache.refresh(required_batches)
+            added,updated = self.cache.refresh(required_batches,self.batch_source.__class__.__name__)
             if added:
                 log.info(f"Added {len(added)} row{'s' if len(added) != 1 else ''} to cache")
             if updated:
@@ -687,4 +689,6 @@ class HoneywellCoXDocumentBot(DocumentBot):
 if __name__ == '__main__':
     bot = HoneywellCoXDocumentBot()
     print(bot.cache.stats())
-    bot.cache.to_csv(r'temp\cache.csv')
+    bot.run()
+    print(bot.cache.stats())
+    #bot.cache.to_csv(r'temp\cache.csv')
