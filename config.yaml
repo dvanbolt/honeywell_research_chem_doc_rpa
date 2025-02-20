@@ -1,4 +1,4 @@
-default_config: coa_prod
+default_config: coa_test
 configs:
   coa_test:
     document: coa
@@ -34,7 +34,7 @@ configs:
     debug: False
     run:
       limit: 0
-      max_attempts: 1
+      max_attempts: 2
       print_cache: False
       save_cache: True
       refresh_cache: True
@@ -51,8 +51,8 @@ configs:
         user: "2f0bd0f3-2690-49a2-80d0-da506522ab70"
     cache:
       type: LocalCache
-      path: "temp/prod/coa.pk"
-    document_path: "temp/prod/coa"
+      path: "temp/test/coa.pk"
+    document_path: "temp/test/coa"
     schedule:
       enabled: true
       cron: "25 7-16/3 * * 1-5 America/Los_Angeles"

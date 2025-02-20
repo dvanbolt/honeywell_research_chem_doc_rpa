@@ -60,6 +60,11 @@ class Config(SimpleNamespace):
 
     ENV_VAR_PATTERN = re.compile(r"\{\{\s*env_var\(['\"](.+?)['\"]\)")
 
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.__unresolved__:dict[str,Exception] = {}
+
+
     @classmethod
     def load(cls, path: Path | str):
         path = Path(path)
@@ -76,6 +81,11 @@ class Config(SimpleNamespace):
 
     def __getitem__(self, key: str) -> t.Any:
         return self.__dict__[key]
+
+    def __getattr__(self, key: str) -> t.Any:
+        if key in self.__unresolved__:
+            raise self.__unresolved__[key]
+        return self.__getattribute__(key)
 
     def items(self):
         return self.__dict__.items()
@@ -109,14 +119,15 @@ class Config(SimpleNamespace):
                 if env_var_match:
                     env_var_name = env_var_match.group(1)
                     try:
-                        return os.environ.get(env_var_name)
+                        return os.environ[env_var_name]
                     except KeyError:
-                        raise ValueError(f"Could not resolve environment variable '{env_var_name}'")
+                        _unresolved[n] = ValueError(f"Could not resolve environment variable '{env_var_name}'")
                 return o
             else:
                 return o
-
+        _unresolved = {}
         inst = cls(**{key: _r(key,value) for (key, value) in d.items()})
+        inst.__unresolved__ = _unresolved
         inst.resolve_paths()
         return inst
 
@@ -346,7 +357,11 @@ class LocalCache(DocCache,dict):
                     not_attempted = len([k for (k, v) in self.items() if v['file_path'] is None and v['last_attempt'] is None])
                     )
 
-    def add_key(self,key:str,default_value:t.Any,default_func:t.Optional[t.Callable]=None) -> None:
+    def add_key_to_schema(self,key:str,default_value:t.Any,default_func:t.Optional[t.Callable]=None) -> None:
+        if default_func is None:
+            default_func = lambda x: default_value
+        for row in self.values():
+            row[key] = default_func(row)
 
 
 class SQLCache(DocCache):
@@ -688,7 +703,10 @@ class HoneywellCoXDocumentBot(DocumentBot):
 
 if __name__ == '__main__':
     bot = HoneywellCoXDocumentBot()
-    print(bot.cache.stats())
+
+    #for row in bot.cache.values():
+        #print(row)
+    #print(bot.cache.stats())
     bot.run()
-    print(bot.cache.stats())
+    #print(bot.cache.stats())
     #bot.cache.to_csv(r'temp\cache.csv')
