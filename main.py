@@ -264,6 +264,9 @@ class DocCache(ABC):
     @abstractmethod
     def open(cls, path)->t.Self:...
 
+    @abstractmethod
+    def add_key_to_schema(self,key:str,default_value:t.Any,default_func:t.Optional[t.Callable]=None) -> None:...
+
 class LocalCache(DocCache,dict):
     __PROPS__ = ['item_number',]
     def __init__(self,config):
@@ -278,27 +281,29 @@ class LocalCache(DocCache,dict):
     def add_batch(self,item:str,catalog:str,batch:str,batch_source:str) -> BatchRecord:
         key = (catalog.lower(),batch.lower())
         if key not in self:
-            new_batch = {"item_number":item,"catalog_number":catalog,"batch_number":batch,"batch_source":batch_source,"added_on":datetime.now(),"attempts":0,"last_attempt":None,"file_path":None}
+            new_batch = {"item_number":item,"catalog_number":catalog,"batch_number":batch,"batch_source":batch_source
+                ,"added_on":datetime.now(),"attempts":0,"last_attempt":None,"file_path":None,'last_exception':None}
             self[key] = new_batch
             return new_batch
         else:
             raise ValueError
 
-    def update_batch(self,catalog_number:str,batch_number:str,file_path:t.Optional[Path]) -> BatchRecord:
+    def update_batch(self,catalog_number:str,batch_number:str,file_path:t.Optional[Path],exception_str:t.Optional[str]) -> BatchRecord:
         key = (catalog_number.lower(),batch_number.lower())
         if key in self:
             row = self[key]
             row["last_attempt"] = datetime.now()
             row["attempts"] = row["attempts"] + 1
             row["file_path"] = file_path
+            row["last_exception"] = exception_str
             return row
         else:
             raise ValueError(f"key {key} not found")
 
-    def update_batches(self, batches:dict[tuple[str,str],Path | None]) -> list[BatchRecord]:
+    def update_batches(self, batches:dict[tuple[str,str],tuple[Path | None,str | None]]) -> list[BatchRecord]:
         updated = []
         for k, v in batches.items():
-            updated.append(self.update_batch(*k, v))
+            updated.append(self.update_batch(*k, *v))
         return updated
 
     def refresh(self,batches:list[dict],batch_source:str) -> tuple[list[BatchRecord],list[BatchRecord]]:
@@ -315,11 +320,11 @@ class LocalCache(DocCache,dict):
         return added,updated
 
     def unresolved_keys(self, max_attempts:int=0,selector:t.Optional[t.Callable] = None, **kwargs) -> list[BatchRecord]:
-        return [k for (k,v) in self.items() if v['file_path'] is None and (max_attempts == 0 or v['attempts'] <= max_attempts) and (selector is None or selector(v))]
+        return [k for (k,v) in self.items() if v['file_path'] is None and (max_attempts == 0 or v['attempts'] < max_attempts) and (selector is None or selector(v))]
 
     def unresolved(self, max_attempts:int=0,) -> list[BatchRecord]:
         return [v for (k, v) in self.items() if
-                v['file_path'] is None and (max_attempts == 0 or v['attempts'] <= max_attempts)]
+                v['file_path'] is None and (max_attempts == 0 or v['attempts'] < max_attempts)]
 
     def resolved(self, max_attempts:int=0,selector:t.Optional[t.Callable] = None, **kwargs) -> list[BatchRecord]:
         return [v for (k, v) in self.items() if
@@ -357,12 +362,11 @@ class LocalCache(DocCache,dict):
                     not_attempted = len([k for (k, v) in self.items() if v['file_path'] is None and v['last_attempt'] is None])
                     )
 
-    def add_key_to_schema(self,key:str,default_value:t.Any,default_func:t.Optional[t.Callable]=None) -> None:
+    def add_key_to_schema(self,key:str,default_value:t.Any = None,default_func:t.Optional[t.Callable]=None) -> None:
         if default_func is None:
             default_func = lambda x: default_value
         for row in self.values():
             row[key] = default_func(row)
-
 
 class SQLCache(DocCache):
     def __init__(self,config:Config):
@@ -434,14 +438,16 @@ class CSVBatchSource(BatchSource):
         return data
 
 class DocumentBot(ABC):
-    def __init__(self, path: Path | str | None = None):
+    def __init__(self, path: Path | str | None = None,config_profile:str | None = None):
         if path is None:
             self.path = Path.cwd()
         else:
             self.path = Path(path)
         config_path = self.path / "config.yaml"
         self.settings = Config.load(config_path)
-        self.config = self.settings.configs[self.settings.default_config]
+        if not config_profile:
+            config_profile = self.settings.default_config
+        self.config = self.settings.configs[config_profile]
         self._build_log(self.config.log)
         log.info(f"Loaded config '"+Fore.GREEN + self.settings.default_config  + Fore.WHITE + f"' from {config_path}")
         self.batch_source = self._load_class_with_config(self.config.batch_source)
@@ -562,7 +568,7 @@ class HoneywellCoXDocumentBot(DocumentBot):
     def _get_documents(self,
                                     batches:list[tuple[str,str]],
                                     save_dir:str | Path,
-                                    doc_type:str) -> dict[tuple[str,str],Path|None]:
+                                    doc_type:str) -> dict[tuple[str,str],tuple[Path|None,Exception|None]]:
         def _trim_id(s:str):
             s = s.lower().strip()
             match = re.search(r"^[a-z0-9]+", s)
@@ -608,13 +614,14 @@ class HoneywellCoXDocumentBot(DocumentBot):
         try:
             total_batches = len(batches)
             for batch_count, batch in enumerate(batches):
+                output_row,output_exc = None, None
                 batch_key = parse_batch_key(batch)
                 existing_doc = existing_docs.get(batch_key)
-                output[batch] = None
+
                 if existing_doc:
-                    output[batch] = existing_doc
+                    output_row = existing_doc
                     log.info(f"Record {batch_count+1}/{total_batches}: Already have {doc_type} for {batch}. key = {batch_key}")
-                else:
+                elif self.config.run.enabled:
                     log.info(f"Record {batch_count+1}/{total_batches}: Downloading {doc_type} for {batch}. key = {batch_key}")
                     if not driver_initialized:
                         # options.add_argument('--headless=new')
@@ -658,6 +665,7 @@ class HoneywellCoXDocumentBot(DocumentBot):
                     except TimeoutException:
                         try:
                             wait.until(EC.presence_of_element_located((By.CLASS_NAME, "no-total-result")))
+                            output_exc = f"Could not find"
                             log.warning(f"Could not find document for {batch_key}")
                         except TimeoutException:
                             raise Exception("Could not find a document or identify 'not found' messages.")
@@ -677,16 +685,21 @@ class HoneywellCoXDocumentBot(DocumentBot):
                                 i+=1
                         if downloaded:
                             bk = parse_batch_key(expected_path)
-                            output[batch] = expected_path
+                            output_row = expected_path
                             existing_docs[bk] = expected_path
                         else:
-                            log.error(f"Download timed out after {download_timeout} seconds")
+                            output_exc =f"Download timed out after {download_timeout} seconds"
+                            log.error(output_exc)
                     finally:
                         for i in range(len(product_number)):
                             catalog_entry.send_keys(Keys.BACKSPACE)
                         for i in range(len(batch_number)):
                             batch_entry.send_keys(Keys.BACKSPACE)
-
+                else:
+                    output_exc = f"Document not found"
+                    log.info(
+                        f"Record {batch_count + 1}/{total_batches}: Not enabled. Skipping web scraping. key = {batch_key}")
+                output[batch] = (output_row, output_exc)
         except Exception as e:
             exception = True
             log.critical(e, exc_info=True)
@@ -694,6 +707,7 @@ class HoneywellCoXDocumentBot(DocumentBot):
             if exception and self.config.debug:
                 i = input(f"Press any key to exit.")
             driver.quit()
+
         return output
 
 
@@ -701,12 +715,31 @@ class HoneywellCoXDocumentBot(DocumentBot):
         self.cache.save()
         exit("bye")
 
-if __name__ == '__main__':
-    bot = HoneywellCoXDocumentBot()
 
+if __name__ == '__main__':
+
+    def populate_bs(v:dict)->str:
+        if v.get('batch_source'):
+            return v['batch_source']
+        return 'CSVBatchSource'
+    def populate_time(v:dict)->datetime:
+        if v.get('added_on'):
+            return v['added_on']
+        return datetime.now() - timedelta(hours=16)
+
+
+    bot = HoneywellCoXDocumentBot(config_profile='coa_test')
+    bot.run()
+    bot = HoneywellCoXDocumentBot(config_profile='coa_prod')
+    bot.run()
+
+    #bot.cache.add_key_to_schema('batch_source', default_func=populate_bs)
+    #bot.cache.add_key_to_schema('added_on', default_func=populate_time)
+   # bot.cache.save()
     #for row in bot.cache.values():
         #print(row)
     #print(bot.cache.stats())
-    bot.run()
+    #bot.run()
+
     #print(bot.cache.stats())
-    #bot.cache.to_csv(r'temp\cache.csv')
+    bot.cache.to_csv(r'temp\cache.csv')

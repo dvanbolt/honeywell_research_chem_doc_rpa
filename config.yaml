@@ -1,4 +1,4 @@
-default_config: coa_test
+default_config: coa_prod
 configs:
   coa_test:
     document: coa
@@ -9,6 +9,7 @@ configs:
       print_cache: False
       save_cache: True
       refresh_cache: True
+      enabled: False
     rpa:
       download_timeout: 3
     batch_source:
@@ -16,8 +17,8 @@ configs:
       path: test_data.csv
     cache:
       type: LocalCache
-      path: "temp/test/coa.pk"
-    document_path: "temp/test/coa"
+      path: "temp/prod/coa/coa.pk"
+    document_path: "temp/prod/coa/docs"
     schedule:
       enabled: true
       cron: "0-59/2 * * * * America/Los_Angeles"
@@ -34,10 +35,11 @@ configs:
     debug: False
     run:
       limit: 0
-      max_attempts: 2
+      max_attempts: 1
       print_cache: False
       save_cache: True
       refresh_cache: True
+      enabled: False
     rpa:
       download_timeout: 5
     batch_source:
@@ -51,8 +53,8 @@ configs:
         user: "2f0bd0f3-2690-49a2-80d0-da506522ab70"
     cache:
       type: LocalCache
-      path: "temp/test/coa.pk"
-    document_path: "temp/test/coa"
+      path: "temp/prod/coa/coa.pk"
+    document_path: "temp/prod/coa/docs"
     schedule:
       enabled: true
       cron: "25 7-16/3 * * 1-5 America/Los_Angeles"
